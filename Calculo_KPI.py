@@ -1,9 +1,13 @@
 # app.py
 # -*- coding: utf-8 -*-
+"""
+KPIs LDS (DATA) – Streamlit (NORMALIZA TEXTOS + BORRA ESPACIOS)
+"""
 
 import io
 import re
 import traceback
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -35,16 +39,46 @@ FALSA_GESTION_INCIDENCIAS = [
 
 
 # =========================
-# HELPERS
+# NORMALIZACIÓN / LIMPIEZA
 # =========================
-def normalize_text(s: str) -> str:
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    s = str(s).replace("\u00A0", " ")
-    s = re.sub(r"\s+", " ", s).strip().lower()
+def _strip_and_fix_spaces(s: str) -> str:
+    s = str(s).replace("\u00A0", " ")  # NBSP -> space
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
+def normalize_text(s) -> str:
+    """
+    Para filtrar incidencias (comparación robusta):
+    - arregla espacios invisibles
+    - lower
+    - elimina tildes/diacríticos (Vehículo == Vehiculo)
+    """
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    s = _strip_and_fix_spaces(s).lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+
+def clean_text_for_output(s) -> str:
+    """Para salida humana (detalle): no quita tildes, solo arregla espacios + trim."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    return _strip_and_fix_spaces(s)
+
+
+def clean_lp(s) -> str:
+    """LP No. limpio para evitar #N/D por espacios invisibles."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    return _strip_and_fix_spaces(s)
+
+
+# =========================
+# HELPERS
+# =========================
 def ensure_columns(df: pd.DataFrame, required: list[str]) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -58,7 +92,14 @@ def add_weekday_filter(df: pd.DataFrame, col_fecha: str) -> pd.DataFrame:
 
 
 def parse_distance_round(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").round(0)
+    """
+    Soporta coma o punto decimal.
+    Ej: "807,2" -> 807.2 -> 807
+    """
+    s = series.copy()
+    s = s.astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+    s = s.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce").round(0)
 
 
 def classify_range(dist_int: pd.Series):
@@ -94,11 +135,18 @@ def short_name(filename: str, max_len: int = 16) -> str:
     return stem[:max_len] if len(stem) > max_len else stem
 
 
+# =========================
+# LÓGICA DE NEGOCIO
+# =========================
 def filter_by_incidencias(df: pd.DataFrame, incidencias: list[str], col_incid: str) -> pd.DataFrame:
+    """
+    No sobreescribe el texto original de incidencia.
+    Crea _incid_norm para filtrar correctamente.
+    """
     incid_set = {normalize_text(x) for x in incidencias}
     temp = df.copy()
-    temp[col_incid] = temp[col_incid].apply(normalize_text)
-    return temp[temp[col_incid].isin(incid_set)].copy()
+    temp["_incid_norm"] = temp[col_incid].apply(normalize_text)
+    return temp[temp["_incid_norm"].isin(incid_set)].copy()
 
 
 def build_summary_by_rider(filtered: pd.DataFrame, rider_col: str, dist_int: pd.Series) -> pd.DataFrame:
@@ -151,14 +199,15 @@ def build_detail(df_filtered: pd.DataFrame,
     dentro, _ = classify_range(dist_int)
 
     detail = pd.DataFrame({
-        "LP No.": df_filtered[col_lp],
-        "Repartidor": df_filtered[col_rider],
+        "LP No.": df_filtered[col_lp].apply(clean_lp),
+        "Repartidor": df_filtered[col_rider].apply(clean_text_for_output),
         "Tiempo del Fracaso de la Entrega": pd.to_datetime(df_filtered[col_fecha], errors="coerce"),
-        "Incidencia Marcada": df_filtered[col_incid],
+        "Incidencia Marcada": df_filtered[col_incid].apply(clean_text_for_output),
         "Distancia de Marcaje": dist_int,
         "Rango": ["Dentro" if x else "Fuera" for x in dentro],
         "Categoría": categoria,
     })
+
     return detail.sort_values(["Tiempo del Fracaso de la Entrega", "Repartidor"], ascending=[True, True])
 
 
@@ -170,6 +219,13 @@ def process_one_df(df: pd.DataFrame) -> dict:
     COL_DIST = "Distancia de brecha de entrega"
 
     ensure_columns(df, [COL_LP, COL_RIDER, COL_FECHA, COL_INCID, COL_DIST])
+
+    # Limpieza preventiva (reduce #N/D)
+    df = df.copy()
+    df[COL_LP] = df[COL_LP].apply(clean_lp)
+    df[COL_RIDER] = df[COL_RIDER].apply(clean_text_for_output)
+    df[COL_INCID] = df[COL_INCID].apply(clean_text_for_output)
+
     df_wd = add_weekday_filter(df, COL_FECHA)
 
     general_summary = build_general_summary(df_wd, COL_DIST)
@@ -192,21 +248,24 @@ def process_one_df(df: pd.DataFrame) -> dict:
     }
 
 
-def build_outputs(files) -> tuple[bytes, str | None]:
+def build_outputs(uploaded_files) -> tuple[bytes, str | None]:
     """
     Retorna (excel_bytes, error_txt_or_none)
+    - Continúa si un archivo falla
+    - Acumula logs en un TXT descargable
     """
     output = io.BytesIO()
-    used_sheets = set()
-    error_logs = []
+    used_sheets: set[str] = set()
+    error_logs: list[str] = []
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for f in files:
+        for uf in uploaded_files:
+            name = getattr(uf, "name", "archivo")
             try:
-                df = pd.read_excel(f)
+                df = pd.read_excel(uf)
                 data = process_one_df(df)
-                short = short_name(getattr(f, "name", "archivo"), max_len=16)
 
+                short = short_name(name, max_len=16)
                 sh_res = make_unique_sheet(f"Resumen_{short}", used_sheets)
                 sh_fake = make_unique_sheet(f"Fake_{short}", used_sheets)
                 sh_fg = make_unique_sheet(f"Falsa_gestion_{short}", used_sheets)
@@ -219,7 +278,6 @@ def build_outputs(files) -> tuple[bytes, str | None]:
 
             except Exception as e:
                 tb = traceback.format_exc()
-                name = getattr(f, "name", "(sin nombre)")
                 error_logs.append(
                     f"===== ERROR ARCHIVO =====\n"
                     f"Archivo: {name}\n"
@@ -234,7 +292,7 @@ def build_outputs(files) -> tuple[bytes, str | None]:
 
 
 # =========================
-# UI
+# STREAMLIT UI
 # =========================
 st.set_page_config(page_title="KPIs LDS - Fake / Falsa gestión", layout="wide")
 st.title("KPIs LDS (DATA) – Fake Deliverys y Falsa gestión")
@@ -247,12 +305,10 @@ files = st.file_uploader(
 )
 
 col1, col2 = st.columns([1, 2])
-
 with col1:
     run_btn = st.button("Generar Excel", type="primary", disabled=not files)
-
 with col2:
-    st.info("Tip: en vez de carpeta, selecciona varios archivos a la vez. Es el equivalente web a 'subir carpeta'.")
+    st.info("En web no se sube carpeta directa: selecciona varios archivos a la vez (equivale a una carpeta).")
 
 if run_btn and files:
     with st.spinner("Procesando archivos..."):
@@ -278,7 +334,6 @@ if run_btn and files:
             mime="text/plain"
         )
 
-    # Vista rápida opcional (solo del primer archivo)
     with st.expander("Vista rápida (primer archivo)"):
         try:
             df0 = pd.read_excel(files[0])
